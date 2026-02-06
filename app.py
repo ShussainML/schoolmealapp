@@ -67,27 +67,6 @@ st.markdown("""
         width: 100%;
     }
 
-    .prompt-chip {
-        display: inline-block;
-        background: #e8f5e9;
-        color: #2d6a4f;
-        padding: 6px 14px;
-        border-radius: 20px;
-        font-size: 0.82rem;
-        margin: 3px 4px;
-        font-weight: 500;
-        border: 1px solid #c8e6c9;
-    }
-
-    .status-box {
-        background: linear-gradient(135deg, #f0fdf4, #dcfce7);
-        border-left: 4px solid #40916c;
-        padding: 12px 16px;
-        border-radius: 0 8px 8px 0;
-        margin: 10px 0;
-        font-size: 0.92rem;
-    }
-
     .how-it-works {
         background: #f8f9fa;
         border-radius: 12px;
@@ -109,6 +88,7 @@ st.markdown("""
 
 # ─── Constants ───
 IMAGE_SIZE = 200
+REQUEST_TIMEOUT = 120
 
 MEAL_CATEGORIES = {
     "🥗 Main Course": [
@@ -182,34 +162,50 @@ def build_prompt(food_description: str, style_prompt: str, extra_details: str = 
     return ", ".join(parts)
 
 
-def generate_image_pollinations(prompt: str, seed: int = None, width: int = IMAGE_SIZE, height: int = IMAGE_SIZE) -> Image.Image | None:
-    """Generate an image using Pollinations.ai free API."""
+def generate_image_pollinations(prompt: str, seed: int, width: int = IMAGE_SIZE, height: int = IMAGE_SIZE) -> tuple:
+    """
+    Generate an image using Pollinations.ai free API.
+    Returns (image_or_none, status_message, debug_info) tuple.
+    """
     encoded = urllib.parse.quote(prompt)
-    seed_val = seed if seed is not None else int(time.time() * 1000) % 999999
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&seed={seed_val}&nologo=true&enhance=true"
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&seed={seed}&nologo=true&enhance=true"
+
+    debug = {"url": url[:200] + "...", "seed": seed}
+
     try:
-        resp = requests.get(url, timeout=60)
-        if resp.status_code == 200 and "image" in resp.headers.get("content-type", ""):
-            return Image.open(io.BytesIO(resp.content))
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        content_type = resp.headers.get("content-type", "unknown")
+        content_length = len(resp.content)
+        debug["status_code"] = resp.status_code
+        debug["content_type"] = content_type
+        debug["content_length"] = content_length
+
+        if resp.status_code == 200 and "image" in content_type and content_length > 500:
+            img = Image.open(io.BytesIO(resp.content))
+            return img, "✅ Success", debug
+        elif resp.status_code == 200:
+            # Got 200 but not an image — might be HTML error page
+            text_preview = resp.content[:300].decode("utf-8", errors="replace")
+            debug["response_preview"] = text_preview
+            return None, f"❌ Got HTTP 200 but content is not an image (type: {content_type}, size: {content_length}B)", debug
+        else:
+            return None, f"❌ HTTP {resp.status_code}: {resp.reason}", debug
+
+    except requests.exceptions.Timeout:
+        return None, f"⏱️ Timed out after {REQUEST_TIMEOUT}s — service may be overloaded", debug
+    except requests.exceptions.ConnectionError as e:
+        return None, f"🔌 Connection failed: {str(e)[:150]}", debug
     except Exception as e:
-        st.error(f"Generation failed: {e}")
-    return None
+        return None, f"❌ {type(e).__name__}: {str(e)[:150]}", debug
 
 
-def image_to_base64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
-
-
-def get_image_download(img: Image.Image, filename: str) -> bytes:
+def get_image_download(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
 def describe_uploaded_image(filename: str) -> str:
-    """Return a basic description hint based on the uploaded file name."""
     name = filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " ")
     return f"food item resembling {name}" if name else ""
 
@@ -219,19 +215,25 @@ if "generated_images" not in st.session_state:
     st.session_state.generated_images = []
 if "generation_count" not in st.session_state:
     st.session_state.generation_count = 0
+if "debug_logs" not in st.session_state:
+    st.session_state.debug_logs = []
 
 
 # ─── Sidebar ───
 with st.sidebar:
     st.markdown("### ⚙️ Generation Settings")
 
-    num_variations = st.slider("Number of variations", 1, 6, 3, help="How many image variations to generate per request")
+    num_variations = st.slider(
+        "Number of variations", 1, 6, 3,
+        help="How many image variations to generate per request",
+    )
 
-    selected_style = st.selectbox("Image style preset", list(STYLE_PRESETS.keys()), index=0)
+    selected_style = st.selectbox(
+        "Image style preset", list(STYLE_PRESETS.keys()), index=0,
+    )
     style_prompt = STYLE_PRESETS[selected_style]
 
     st.markdown("---")
-
     st.markdown("### 📋 How It Works")
     st.markdown("""
     <div class="how-it-works">
@@ -248,7 +250,11 @@ with st.sidebar:
     st.metric("Images Generated", st.session_state.generation_count)
 
     st.markdown("---")
-    st.caption("Powered by [Pollinations.ai](https://pollinations.ai) — free & open AI image generation. No API key required.")
+    show_debug = st.checkbox("🐛 Show debug logs", value=False)
+
+    st.markdown("---")
+    st.caption("Powered by [Pollinations.ai](https://pollinations.ai) — free & open AI image generation.")
+    st.caption("⚠️ First generation may take **30–90 seconds** as the model warms up.")
 
 
 # ─── Main Content ───
@@ -338,45 +344,125 @@ with col_clear:
     if st.button("🗑️ Clear All", use_container_width=True):
         st.session_state.generated_images = []
         st.session_state.generation_count = 0
+        st.session_state.debug_logs = []
         st.rerun()
 
 if not food_desc and generate_clicked:
     st.warning("Please select a meal or type a description first.")
 
-# ─── Generation Logic ───
+# ─── Generation Logic (inside st.status for visible progress) ───
 if generate_clicked and food_desc:
     full_prompt = build_prompt(food_desc, style_prompt, extra_details, ref_description)
 
     st.markdown("---")
-    st.markdown(f"**Generating {num_variations} variation(s)** for: *{food_desc}*")
 
-    progress = st.progress(0, text="Starting generation...")
     generated_batch = []
+    batch_logs = []
 
-    for i in range(num_variations):
-        progress.progress(
-            (i) / num_variations,
-            text=f"Generating variation {i + 1} of {num_variations}...",
+    with st.status(
+        f"🍳 Generating {num_variations} image(s) for: **{food_desc}**",
+        expanded=True,
+    ) as status:
+
+        st.markdown(f"**Meal:** {food_desc}")
+        st.markdown(f"**Style:** {selected_style}")
+        st.caption(f"Prompt: {full_prompt[:150]}...")
+        st.markdown("---")
+
+        st.warning(
+            "⏳ **Please wait patiently** — Pollinations.ai is a free service and each image "
+            "can take **30–90 seconds**. The page will update automatically. "
+            "**Do NOT close or refresh this page.**"
         )
-        seed = int(time.time() * 1000) % 999999 + i * 1000
-        img = generate_image_pollinations(full_prompt, seed=seed)
-        if img:
-            generated_batch.append({
-                "image": img,
-                "prompt": full_prompt,
-                "food": food_desc,
-                "style": selected_style,
-                "seed": seed,
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
-            })
-            st.session_state.generation_count += 1
 
-    progress.progress(1.0, text="✅ Generation complete!")
-    time.sleep(0.5)
-    progress.empty()
+        progress_bar = st.progress(0, text="Initialising...")
 
-    # Prepend new images to session state
+        for i in range(num_variations):
+            progress_text = f"⏳ Generating variation {i + 1} of {num_variations}... (may take up to 90s)"
+            progress_bar.progress(i / num_variations, text=progress_text)
+
+            seed = int(time.time() * 1000) % 999999 + i * 1337
+            start_time = time.time()
+
+            st.write(f"🔄 **Variation {i + 1}/{num_variations}** — Sending request (seed: `{seed}`)...")
+
+            img, status_msg, debug_info = generate_image_pollinations(full_prompt, seed=seed)
+            elapsed = time.time() - start_time
+
+            log_entry = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "variation": i + 1,
+                "status": status_msg,
+                "elapsed": f"{elapsed:.1f}s",
+                "debug": debug_info,
+            }
+            batch_logs.append(log_entry)
+
+            if img:
+                st.write(f"✅ **Variation {i + 1}** — Done in {elapsed:.1f}s")
+                # Show a small preview immediately
+                st.image(img, width=120, caption=f"Variation {i + 1}")
+                generated_batch.append({
+                    "image": img,
+                    "prompt": full_prompt,
+                    "food": food_desc,
+                    "style": selected_style,
+                    "seed": seed,
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "elapsed": f"{elapsed:.1f}s",
+                })
+                st.session_state.generation_count += 1
+            else:
+                st.error(f"⚠️ **Variation {i + 1}** failed ({elapsed:.1f}s): {status_msg}")
+
+        progress_bar.progress(1.0, text="✅ All done!")
+
+        success_count = len(generated_batch)
+        fail_count = num_variations - success_count
+
+        st.markdown("---")
+        if success_count > 0:
+            st.success(f"🎉 **{success_count}/{num_variations}** images generated successfully!")
+        if fail_count > 0:
+            st.warning(
+                f"⚠️ {fail_count} image(s) failed. Enable '🐛 Show debug logs' "
+                "in the sidebar for details."
+            )
+        if success_count == 0:
+            st.error(
+                "❌ All generations failed. This usually means Pollinations.ai is "
+                "overloaded or temporarily down. Please try again in a few minutes, "
+                "or try with just 1 variation."
+            )
+
+        # Update status label
+        if success_count > 0:
+            status.update(
+                label=f"✅ Done — {success_count}/{num_variations} images generated!",
+                state="complete",
+                expanded=False,
+            )
+        else:
+            status.update(
+                label=f"❌ Failed — 0/{num_variations} images generated",
+                state="error",
+                expanded=True,
+            )
+
+    # Save logs and images to session
+    st.session_state.debug_logs = batch_logs + st.session_state.debug_logs
     st.session_state.generated_images = generated_batch + st.session_state.generated_images
+
+# ─── Debug Logs ───
+if show_debug and st.session_state.debug_logs:
+    with st.expander("🐛 Debug Logs", expanded=True):
+        for log in st.session_state.debug_logs:
+            st.markdown(
+                f"**[{log['time']}] Var {log['variation']}** — "
+                f"{log['status']} — {log['elapsed']}"
+            )
+            if "debug" in log:
+                st.json(log["debug"])
 
 # ─── Results Grid ───
 st.markdown("---")
@@ -385,8 +471,6 @@ st.markdown("### 🖼️ Generated Images")
 images = st.session_state.generated_images
 
 if not images:
-    # Placeholder grid
-    st.markdown("")
     placeholder_cols = st.columns(4)
     for i, pc in enumerate(placeholder_cols):
         with pc:
@@ -411,10 +495,9 @@ if not images:
                 </div>
             </div>
             """, unsafe_allow_html=True)
-    st.info("Select a meal and click **Generate Images** to see results here.")
+    st.info("☝️ Select a meal and click **Generate Images** to see results here.")
 else:
-    # Display in grid of 3 or 4 columns
-    cols_per_row = 4 if len(images) >= 4 else len(images)
+    cols_per_row = 4 if len(images) >= 4 else max(len(images), 1)
     for row_start in range(0, len(images), cols_per_row):
         row_images = images[row_start:row_start + cols_per_row]
         cols = st.columns(cols_per_row)
@@ -428,9 +511,12 @@ else:
                     st.image(img, use_container_width=True)
                     st.markdown('</div>', unsafe_allow_html=True)
 
-                    st.caption(f"**{item['food'][:40]}**  \n{item['style']} · {item['timestamp']}")
+                    st.caption(
+                        f"**{item['food'][:40]}**  \n"
+                        f"{item['style']} · {item['timestamp']} · {item.get('elapsed', '')}"
+                    )
 
-                    img_bytes = get_image_download(img, "meal.png")
+                    img_bytes = get_image_download(img)
                     st.download_button(
                         "⬇ Download",
                         data=img_bytes,
@@ -440,12 +526,31 @@ else:
                         key=f"dl_{row_start}_{idx}_{item['seed']}",
                     )
 
+# ─── Troubleshooting ───
+with st.expander("🔧 Troubleshooting — Images not generating?"):
+    st.markdown("""
+    **Common issues and fixes:**
+
+    1. **Slow generation (30–90s)** — Normal for Pollinations.ai free tier. First request is slowest.
+
+    2. **Timeout errors** — Service may be overloaded. Try again in a few minutes with just 1 variation.
+
+    3. **Connection errors** — Check your internet. Corporate firewalls/VPNs may block `image.pollinations.ai`.
+
+    4. **Images look wrong** — Try "Realistic Photo" preset and be more specific in description.
+
+    5. **For production** — Upgrade to paid APIs:
+       - **OpenAI DALL·E 3** — ~$0.04/image, high quality
+       - **Stability AI** — Stable Diffusion, cost-effective
+       - **Flux Pro** — excellent photorealism
+    """)
+
 # ─── Footer ───
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #adb5bd; font-size: 0.82rem; padding: 10px 0 20px 0;">
     <strong>School Meal Image Generator</strong> — Demo for AI-powered menu image generation<br>
-    Uses <a href="https://pollinations.ai" target="_blank" style="color: #40916c;">Pollinations.ai</a> for free image generation · Built with Streamlit<br>
+    Uses <a href="https://pollinations.ai" target="_blank" style="color: #40916c;">Pollinations.ai</a> · Built with Streamlit<br>
     Images are 200×200px · Optimised for school meal display systems
 </div>
 """, unsafe_allow_html=True)
